@@ -1,0 +1,12 @@
+Device Name Customization:
+
+Web interface to change device name
+Persistent storage of custom name
+Update AP SSID and mDNS name
+Validation and sanitization
+Enhanced Configuration:
+
+Sensor enable/disable toggles
+Update intervals
+Theme selection
+Factory reset option
