@@ -1,629 +1,664 @@
- #include "web_server.h"
-#include "wifi_manager.h"
 #include "sensor_manager.h"
-#include "html_pages.h"
-
-// Static instance pointer
-WebServerManager* WebServerManager::_instance = nullptr;
+#include <algorithm>
+#include <numeric>
 
 // ================================
 // CONSTRUCTOR & INITIALIZATION
 // ================================
 
-WebServerManager::WebServerManager() :
-    _server(nullptr),
-    _webSocket(nullptr),
-    _wifiManager(nullptr),
-    _sensorManager(nullptr),
-    _isRunning(false),
-    _startTime(0),
-    _requestCount(0),
-    _errorCount(0),
-    _lastBroadcast(0),
-    _onDeviceNameChangeCallback(nullptr),
-    _onLEDControlCallback(nullptr),
-    _onFactoryResetCallback(nullptr),
-    _onRestartCallback(nullptr)
+SensorManager::SensorManager() :
+    _maxHistorySize(SENSOR_HISTORY_SIZE),
+    _statsValid(false),
+    _temperatureEnabled(SENSOR_TEMPERATURE),
+    _humidityEnabled(SENSOR_HUMIDITY),
+    _pressureEnabled(SENSOR_PRESSURE),
+    _lightEnabled(SENSOR_LIGHT),
+    _motionEnabled(SENSOR_MOTION),
+    _batteryEnabled(SENSOR_BATTERY),
+    _lastUpdate(0),
+    _updateInterval(SENSOR_UPDATE_INTERVAL),
+    _lastStatsUpdate(0),
+    _tempBase(TEMP_BASE),
+    _tempTrend(0.0),
+    _humidityBase(HUMIDITY_BASE),
+    _humidityTrend(0.0),
+    _pressureBase(PRESSURE_BASE),
+    _pressureTrend(0.0),
+    _lightBase(50.0),
+    _lightTrend(0.0),
+    _motionActive(false),
+    _motionStartTime(0),
+    _lastMotionEvent(0),
+    _motionEventCount(0),
+    _batteryLevel(85.0),
+    _batteryCharging(false),
+    _lastBatteryUpdate(0),
+    _tempOffset(0.0),
+    _humidityOffset(0.0),
+    _pressureOffset(0.0),
+    _uptimeCallback(nullptr),
+    _bootCountCallback(nullptr),
+    _totalConnectionsCallback(nullptr),
+    _wifiSSIDCallback(nullptr),
+    _wifiRSSICallback(nullptr),
+    _ledStateCallback(nullptr),
+    _webSocketClientsCallback(nullptr)
 {
-    _instance = this;
+    // Initialize current reading
+    memset(&_currentReading, 0, sizeof(SensorReading));
+    memset(&_stats, 0, sizeof(SensorStats));
+    
+    // Reserve history vector
+    _history.reserve(_maxHistorySize);
 }
 
-void WebServerManager::begin() {
-    DEBUG_I("Initializing Web Server Manager...");
+void SensorManager::begin() {
+    DEBUG_I("Initializing Sensor Manager...");
     
-    // Create server instance
-    _server = new AsyncWebServer(WEB_SERVER_PORT);
-    _webSocket = new AsyncWebSocket(WEBSOCKET_PATH);
+    // Initialize random seed for sensor simulation
+    randomSeed(analogRead(0) + millis());
     
-    // Setup routes and handlers
-    _setupRoutes();
-    _setupWebSocketHandlers();
-    _setupCORSHeaders();
+    // Set initial sensor values
+    _currentReading.timestamp = millis();
+    _currentReading.temperature = _tempBase;
+    _currentReading.humidity = _humidityBase;
+    _currentReading.pressure = _pressureBase;
+    _currentReading.lightLevel = _lightBase;
+    _currentReading.motionDetected = false;
+    _currentReading.batteryLevel = _batteryLevel;
     
-    // Start server
-    start();
+    // Initialize statistics
+    _stats.minTemperature = _tempBase;
+    _stats.maxTemperature = _tempBase;
+    _stats.avgTemperature = _tempBase;
+    _stats.minHumidity = _humidityBase;
+    _stats.maxHumidity = _humidityBase;
+    _stats.avgHumidity = _humidityBase;
+    _stats.minPressure = _pressureBase;
+    _stats.maxPressure = _pressureBase;
+    _stats.avgPressure = _pressureBase;
+    _stats.minLightLevel = _lightBase;
+    _stats.maxLightLevel = _lightBase;
+    _stats.avgLightLevel = _lightBase;
+    _stats.motionEvents = 0;
+    _stats.lastMotionTime = 0;
+    _stats.batteryHealth = 100.0;
+    _stats.dataPoints = 0;
     
-    DEBUG_I("Web Server Manager initialized successfully");
+    DEBUG_I("Sensor Manager initialized successfully");
+    DEBUG_I("Enabled sensors: T:%d H:%d P:%d L:%d M:%d B:%d", 
+           _temperatureEnabled, _humidityEnabled, _pressureEnabled,
+           _lightEnabled, _motionEnabled, _batteryEnabled);
 }
 
-void WebServerManager::end() {
-    DEBUG_I("Shutting down Web Server Manager...");
+void SensorManager::end() {
+    DEBUG_I("Shutting down Sensor Manager...");
     
-    stop();
+    _history.clear();
+    _statsValid = false;
     
-    if (_webSocket) {
-        delete _webSocket;
-        _webSocket = nullptr;
-    }
-    
-    if (_server) {
-        delete _server;
-        _server = nullptr;
-    }
-    
-    DEBUG_I("Web Server Manager shutdown complete");
-}
-
-// ================================
-// SERVER CONTROL
-// ================================
-
-void WebServerManager::start() {
-    if (_isRunning || !_server) {
-        return;
-    }
-    
-    DEBUG_I("Starting web server on port %d", WEB_SERVER_PORT);
-    
-    _server->begin();
-    _isRunning = true;
-    _startTime = millis();
-    
-    DEBUG_I("Web server started successfully");
-}
-
-void WebServerManager::stop() {
-    if (!_isRunning || !_server) {
-        return;
-    }
-    
-    DEBUG_I("Stopping web server");
-    
-    _server->end();
-    _isRunning = false;
-    
-    DEBUG_I("Web server stopped");
-}
-
-bool WebServerManager::isRunning() {
-    return _isRunning;
+    DEBUG_I("Sensor Manager shutdown complete");
 }
 
 // ================================
-// MAIN LOOP HANDLER
+// MAIN UPDATE LOOP
 // ================================
 
-void WebServerManager::handleClient() {
-    // WebSocket cleanup
-    if (_webSocket) {
-        _webSocket->cleanupClients();
-    }
-    
-    // Periodic sensor data broadcast
+void SensorManager::update() {
     unsigned long currentTime = millis();
-    if (currentTime - _lastBroadcast >= SENSOR_UPDATE_INTERVAL) {
-        broadcastSensorData();
-        _lastBroadcast = currentTime;
+    
+    // Check if it's time to update sensors
+    if (currentTime - _lastUpdate >= _updateInterval) {
+        _updateSensors();
+        _lastUpdate = currentTime;
+        
+        // Add to history
+        _addToHistory(_currentReading);
+        
+        // Update statistics periodically
+        if (currentTime - _lastStatsUpdate >= STATS_UPDATE_INTERVAL) {
+            _updateStatistics();
+            _lastStatsUpdate = currentTime;
+        }
+    }
+    
+    // Handle motion detection timeout
+    if (_motionActive && (currentTime - _motionStartTime) >= MOTION_DURATION_MS) {
+        _motionActive = false;
+        _currentReading.motionDetected = false;
+        DEBUG_V("Motion detection timeout");
     }
 }
 
 // ================================
-// WEBSOCKET MANAGEMENT
+// SENSOR CONTROL
 // ================================
 
-void WebServerManager::broadcastMessage(const String& message) {
-    if (_webSocket && _webSocket->count() > 0) {
-        _webSocket->textAll(message);
-        DEBUG_V("Broadcast message to %d clients", _webSocket->count());
+void SensorManager::enableSensor(const String& sensorName, bool enabled) {
+    String sensor = sensorName;
+    sensor.toLowerCase();
+    
+    if (sensor == "temperature") {
+        _temperatureEnabled = enabled;
+    } else if (sensor == "humidity") {
+        _humidityEnabled = enabled;
+    } else if (sensor == "pressure") {
+        _pressureEnabled = enabled;
+    } else if (sensor == "light") {
+        _lightEnabled = enabled;
+    } else if (sensor == "motion") {
+        _motionEnabled = enabled;
+    } else if (sensor == "battery") {
+        _batteryEnabled = enabled;
     }
+    
+    DEBUG_I("Sensor %s %s", sensorName.c_str(), enabled ? "enabled" : "disabled");
 }
 
-void WebServerManager::broadcastSensorData() {
-    if (_sensorManager) {
-        String sensorData = _sensorManager->getSensorDataJSON();
-        broadcastMessage(sensorData);
-    }
+bool SensorManager::isSensorEnabled(const String& sensorName) {
+    String sensor = sensorName;
+    sensor.toLowerCase();
+    
+    if (sensor == "temperature") return _temperatureEnabled;
+    if (sensor == "humidity") return _humidityEnabled;
+    if (sensor == "pressure") return _pressureEnabled;
+    if (sensor == "light") return _lightEnabled;
+    if (sensor == "motion") return _motionEnabled;
+    if (sensor == "battery") return _batteryEnabled;
+    
+    return false;
 }
 
-void WebServerManager::broadcastDeviceStats() {
-    if (_sensorManager) {
-        String deviceStats = _sensorManager->getDeviceStatsJSON();
-        broadcastMessage(deviceStats);
-    }
+void SensorManager::setUpdateInterval(unsigned long interval) {
+    _updateInterval = max(interval, 100UL); // Minimum 100ms
+    DEBUG_I("Sensor update interval set to %lu ms", _updateInterval);
 }
 
-int WebServerManager::getWebSocketClientCount() {
-    return _webSocket ? _webSocket->count() : 0;
+unsigned long SensorManager::getUpdateInterval() {
+    return _updateInterval;
 }
 
 // ================================
-// MANAGER REFERENCES
+// DATA ACCESS
 // ================================
 
-void WebServerManager::setWiFiManager(WiFiManager* wifiManager) {
-    _wifiManager = wifiManager;
+SensorReading SensorManager::getCurrentReading() {
+    return _currentReading;
 }
 
-void WebServerManager::setSensorManager(SensorManager* sensorManager) {
-    _sensorManager = sensorManager;
+std::vector<SensorReading> SensorManager::getHistory() {
+    return _history;
+}
+
+SensorStats SensorManager::getStatistics() {
+    if (!_statsValid) {
+        _calculateStatistics();
+    }
+    return _stats;
+}
+
+DeviceStats SensorManager::getDeviceStatistics() {
+    DeviceStats stats;
+    
+    // Get system information
+    stats.uptime = _uptimeCallback ? _uptimeCallback() : millis();
+    stats.bootCount = _bootCountCallback ? _bootCountCallback() : 0;
+    stats.totalConnections = _totalConnectionsCallback ? _totalConnectionsCallback() : 0;
+    stats.freeHeap = ESP.getFreeHeap();
+    stats.totalHeap = ESP.getHeapSize();
+    stats.cpuUsage = 0.0; // Simplified - would need more complex calculation
+    stats.wifiSSID = _wifiSSIDCallback ? _wifiSSIDCallback() : "";
+    stats.wifiRSSI = _wifiRSSICallback ? _wifiRSSICallback() : 0;
+    stats.localIP = WiFi.localIP();
+    stats.macAddress = WiFi.macAddress();
+    stats.temperature = ESP.getTemperature();
+    stats.ledState = _ledStateCallback ? _ledStateCallback() : false;
+    stats.webSocketClients = _webSocketClientsCallback ? _webSocketClientsCallback() : 0;
+    
+    return stats;
+}
+
+// ================================
+// JSON OUTPUT
+// ================================
+
+String SensorManager::getSensorDataJSON() {
+    DynamicJsonDocument doc(1024);
+    
+    doc["timestamp"] = _currentReading.timestamp;
+    
+    if (_temperatureEnabled) {
+        doc["temperature"] = round(_currentReading.temperature * 10) / 10.0;
+    }
+    
+    if (_humidityEnabled) {
+        doc["humidity"] = round(_currentReading.humidity * 10) / 10.0;
+    }
+    
+    if (_pressureEnabled) {
+        doc["pressure"] = round(_currentReading.pressure * 100) / 100.0;
+    }
+    
+    if (_lightEnabled) {
+        doc["light_level"] = round(_currentReading.lightLevel * 10) / 10.0;
+    }
+    
+    if (_motionEnabled) {
+        doc["motion_detected"] = _currentReading.motionDetected;
+    }
+    
+    if (_batteryEnabled) {
+        doc["battery_level"] = round(_currentReading.batteryLevel * 10) / 10.0;
+    }
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+String SensorManager::getSensorHistoryJSON() {
+    DynamicJsonDocument doc(4096);
+    JsonArray historyArray = doc.createNestedArray("history");
+    
+    // Get last 20 readings for history
+    int startIndex = max(0, (int)_history.size() - 20);
+    
+    for (int i = startIndex; i < _history.size(); i++) {
+        JsonObject reading = historyArray.createNestedObject();
+        reading["timestamp"] = _history[i].timestamp;
+        
+        if (_temperatureEnabled) {
+            reading["temperature"] = round(_history[i].temperature * 10) / 10.0;
+        }
+        
+        if (_humidityEnabled) {
+            reading["humidity"] = round(_history[i].humidity * 10) / 10.0;
+        }
+        
+        if (_pressureEnabled) {
+            reading["pressure"] = round(_history[i].pressure * 100) / 100.0;
+        }
+        
+        if (_lightEnabled) {
+            reading["light_level"] = round(_history[i].lightLevel * 10) / 10.0;
+        }
+        
+        if (_batteryEnabled) {
+            reading["battery_level"] = round(_history[i].batteryLevel * 10) / 10.0;
+        }
+    }
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+String SensorManager::getSensorStatsJSON() {
+    if (!_statsValid) {
+        _calculateStatistics();
+    }
+    
+    DynamicJsonDocument doc(1024);
+    
+    if (_temperatureEnabled) {
+        JsonObject temp = doc.createNestedObject("temperature");
+        temp["min"] = round(_stats.minTemperature * 10) / 10.0;
+        temp["max"] = round(_stats.maxTemperature * 10) / 10.0;
+        temp["avg"] = round(_stats.avgTemperature * 10) / 10.0;
+    }
+    
+    if (_humidityEnabled) {
+        JsonObject humidity = doc.createNestedObject("humidity");
+        humidity["min"] = round(_stats.minHumidity * 10) / 10.0;
+        humidity["max"] = round(_stats.maxHumidity * 10) / 10.0;
+        humidity["avg"] = round(_stats.avgHumidity * 10) / 10.0;
+    }
+    
+    if (_pressureEnabled) {
+        JsonObject pressure = doc.createNestedObject("pressure");
+        pressure["min"] = round(_stats.minPressure * 100) / 100.0;
+        pressure["max"] = round(_stats.maxPressure * 100) / 100.0;
+        pressure["avg"] = round(_stats.avgPressure * 100) / 100.0;
+    }
+    
+    if (_lightEnabled) {
+        JsonObject light = doc.createNestedObject("light");
+        light["min"] = round(_stats.minLightLevel * 10) / 10.0;
+        light["max"] = round(_stats.maxLightLevel * 10) / 10.0;
+        light["avg"] = round(_stats.avgLightLevel * 10) / 10.0;
+    }
+    
+    if (_motionEnabled) {
+        JsonObject motion = doc.createNestedObject("motion");
+        motion["events"] = _stats.motionEvents;
+        motion["last_detection"] = _stats.lastMotionTime;
+    }
+    
+    if (_batteryEnabled) {
+        JsonObject battery = doc.createNestedObject("battery");
+        battery["level"] = round(_currentReading.batteryLevel * 10) / 10.0;
+        battery["health"] = round(_stats.batteryHealth * 10) / 10.0;
+    }
+    
+    doc["data_points"] = _stats.dataPoints;
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+String SensorManager::getDeviceStatsJSON() {
+    DeviceStats stats = getDeviceStatistics();
+    
+    DynamicJsonDocument doc(1024);
+    
+    doc["uptime"] = stats.uptime;
+    doc["boot_count"] = stats.bootCount;
+    doc["total_connections"] = stats.totalConnections;
+    doc["free_heap"] = stats.freeHeap;
+    doc["total_heap"] = stats.totalHeap;
+    doc["heap_usage"] = round(((float)(stats.totalHeap - stats.freeHeap) / stats.totalHeap) * 1000) / 10.0;
+    doc["wifi_ssid"] = stats.wifiSSID;
+    doc["wifi_rssi"] = stats.wifiRSSI;
+    doc["local_ip"] = stats.localIP.toString();
+    doc["mac_address"] = stats.macAddress;
+    doc["chip_temperature"] = round(stats.temperature * 10) / 10.0;
+    doc["led_state"] = stats.ledState;
+    doc["websocket_clients"] = stats.webSocketClients;
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+String SensorManager::getAllDataJSON() {
+    DynamicJsonDocument doc(2048);
+    
+    // Current sensor data
+    JsonObject sensors = doc.createNestedObject("sensors");
+    DynamicJsonDocument sensorDoc(1024);
+    deserializeJson(sensorDoc, getSensorDataJSON());
+    sensors.set(sensorDoc.as<JsonObject>());
+    
+    // Device statistics
+    JsonObject device = doc.createNestedObject("device");
+    DynamicJsonDocument deviceDoc(1024);
+    deserializeJson(deviceDoc, getDeviceStatsJSON());
+    device.set(deviceDoc.as<JsonObject>());
+    
+    // Sensor statistics
+    JsonObject stats = doc.createNestedObject("statistics");
+    DynamicJsonDocument statsDoc(1024);
+    deserializeJson(statsDoc, getSensorStatsJSON());
+    stats.set(statsDoc.as<JsonObject>());
+    
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+// ================================
+// DATA MANAGEMENT
+// ================================
+
+void SensorManager::clearHistory() {
+    _history.clear();
+    _statsValid = false;
+    DEBUG_I("Sensor history cleared");
+}
+
+void SensorManager::resetStatistics() {
+    memset(&_stats, 0, sizeof(SensorStats));
+    _statsValid = false;
+    DEBUG_I("Sensor statistics reset");
+}
+
+int SensorManager::getHistorySize() {
+    return _history.size();
+}
+
+void SensorManager::setHistorySize(int size) {
+    _maxHistorySize = max(size, 10); // Minimum 10 readings
+    
+    // Trim history if needed
+    while (_history.size() > _maxHistorySize) {
+        _history.erase(_history.begin());
+    }
+    
+    DEBUG_I("History size set to %d", _maxHistorySize);
+}
+
+// ================================
+// CALIBRATION
+// ================================
+
+void SensorManager::calibrateTemperature(float offset) {
+    _tempOffset = offset;
+    DEBUG_I("Temperature calibration offset: %.2f°C", offset);
+}
+
+void SensorManager::calibrateHumidity(float offset) {
+    _humidityOffset = offset;
+    DEBUG_I("Humidity calibration offset: %.2f%%", offset);
+}
+
+void SensorManager::calibratePressure(float offset) {
+    _pressureOffset = offset;
+    DEBUG_I("Pressure calibration offset: %.2f hPa", offset);
+}
+
+// ================================
+// BATTERY MANAGEMENT
+// ================================
+
+void SensorManager::setBatteryLevel(float level) {
+    _batteryLevel = constrain(level, 0.0, 100.0);
+    _currentReading.batteryLevel = _batteryLevel;
+}
+
+float SensorManager::getBatteryLevel() {
+    return _batteryLevel;
+}
+
+bool SensorManager::isBatteryLow() {
+    return _batteryLevel < BATTERY_RECHARGE_THRESHOLD;
+}
+
+// ================================
+// MOTION DETECTION
+// ================================
+
+bool SensorManager::isMotionDetected() {
+    return _motionActive;
+}
+
+unsigned long SensorManager::getLastMotionTime() {
+    return _lastMotionEvent;
+}
+
+int SensorManager::getMotionEventCount() {
+    return _motionEventCount;
 }
 
 // ================================
 // CALLBACK REGISTRATION
 // ================================
 
-void WebServerManager::onDeviceNameChange(std::function<void(const String&)> callback) {
-    _onDeviceNameChangeCallback = callback;
+void SensorManager::setUptimeCallback(std::function<unsigned long()> callback) {
+    _uptimeCallback = callback;
 }
 
-void WebServerManager::onLEDControl(std::function<void(bool)> callback) {
-    _onLEDControlCallback = callback;
+void SensorManager::setBootCountCallback(std::function<uint32_t()> callback) {
+    _bootCountCallback = callback;
 }
 
-void WebServerManager::onFactoryReset(std::function<void()> callback) {
-    _onFactoryResetCallback = callback;
+void SensorManager::setTotalConnectionsCallback(std::function<uint32_t()> callback) {
+    _totalConnectionsCallback = callback;
 }
 
-void WebServerManager::onRestart(std::function<void()> callback) {
-    _onRestartCallback = callback;
+void SensorManager::setWiFiInfoCallback(std::function<String()> ssidCallback, std::function<int()> rssiCallback) {
+    _wifiSSIDCallback = ssidCallback;
+    _wifiRSSICallback = rssiCallback;
 }
 
-// ================================
-// ROUTE SETUP
-// ================================
-
-void WebServerManager::_setupRoutes() {
-    if (!_server) return;
-    
-    DEBUG_I("Setting up web server routes...");
-    
-    // Root page handler
-    _server->on("/", HTTP_GET, [this](AsyncWebServerRequest* request) {
-        _handleRoot(request);
-    });
-    
-    // API Routes
-    _server->on((API_PREFIX + API_SCAN).c_str(), HTTP_GET, [this](AsyncWebServerRequest* request) {
-        _handleAPIScan(request);
-    });
-    
-    _server->on((API_PREFIX + API_CONNECT).c_str(), HTTP_POST, [this](AsyncWebServerRequest* request) {
-        _handleAPIConnect(request);
-    });
-    
-    _server->on((API_PREFIX + API_STATUS).c_str(), HTTP_GET, [this](AsyncWebServerRequest* request) {
-        _handleAPIStatus(request);
-    });
-    
-    _server->on((API_PREFIX + API_SENSOR_DATA).c_str(), HTTP_GET, [this](AsyncWebServerRequest* request) {
-        _handleAPISensorData(request);
-    });
-    
-    _server->on((API_PREFIX + API_DEVICE_STATS).c_str(), HTTP_GET, [this](AsyncWebServerRequest* request) {
-        _handleAPIDeviceStats(request);
-    });
-    
-    _server->on((API_PREFIX + API_DEVICE_NAME).c_str(), HTTP_POST, [this](AsyncWebServerRequest* request) {
-        _handleAPIDeviceName(request);
-    });
-    
-    _server->on((API_PREFIX + API_LED_CONTROL).c_str(), HTTP_POST, [this](AsyncWebServerRequest* request) {
-        _handleAPILEDControl(request);
-    });
-    
-    _server->on((API_PREFIX + API_FACTORY_RESET).c_str(), HTTP_POST, [this](AsyncWebServerRequest* request) {
-        _handleAPIFactoryReset(request);
-    });
-    
-    _server->on((API_PREFIX + API_RESTART).c_str(), HTTP_POST, [this](AsyncWebServerRequest* request) {
-        _handleAPIRestart(request);
-    });
-    
-    // 404 handler
-    _server->onNotFound([this](AsyncWebServerRequest* request) {
-        _handleNotFound(request);
-    });
-    
-    DEBUG_I("Web server routes configured");
+void SensorManager::setLEDStateCallback(std::function<bool()> callback) {
+    _ledStateCallback = callback;
 }
 
-void WebServerManager::_setupWebSocketHandlers() {
-    if (!_webSocket || !_server) return;
-    
-    DEBUG_I("Setting up WebSocket handlers...");
-    
-    _webSocket->onEvent(_staticWebSocketEvent);
-    _server->addHandler(_webSocket);
-    
-    DEBUG_I("WebSocket handlers configured");
-}
-
-void WebServerManager::_setupCORSHeaders() {
-    if (!_server) return;
-    
-    // Add CORS headers to all responses
-    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
-    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    DefaultHeaders::Instance().addHeader("Access-Control-Max-Age", String(CORS_MAX_AGE));
-    
-    DEBUG_I("CORS headers configured");
+void SensorManager::setWebSocketClientsCallback(std::function<int()> callback) {
+    _webSocketClientsCallback = callback;
 }
 
 // ================================
-// PAGE HANDLERS
+// PRIVATE METHODS
 // ================================
 
-void WebServerManager::_handleRoot(AsyncWebServerRequest* request) {
-    _requestCount++;
+void SensorManager::_updateSensors() {
+    _currentReading.timestamp = millis();
     
-    DEBUG_D("Handling root request from: %s", request->client()->remoteIP().toString().c_str());
-    
-    String html;
-    
-    if (_wifiManager && _wifiManager->isConnected()) {
-        // Show dashboard if connected to WiFi
-        html = getDashboardHTML();
-    } else {
-        // Show WiFi setup if not connected
-        html = getWiFiSetupHTML();
+    if (_temperatureEnabled) {
+        _updateTemperature();
     }
     
-    AsyncWebServerResponse* response = request->beginResponse(200, "text/html", html);
-    _addCORSHeaders(response);
-    request->send(response);
-}
-
-void WebServerManager::_handleNotFound(AsyncWebServerRequest* request) {
-    _errorCount++;
-    
-    DEBUG_W("404 Not Found: %s", request->url().c_str());
-    
-    // For captive portal, redirect to root
-    if (_wifiManager && _wifiManager->isAccessPointActive()) {
-        AsyncWebServerResponse* response = request->beginResponse(302);
-        response->addHeader("Location", "http://" + _wifiManager->getAccessPointIP().toString());
-        _addCORSHeaders(response);
-        request->send(response);
-    } else {
-        _sendErrorResponse(request, "Page not found", 404);
+    if (_humidityEnabled) {
+        _updateHumidity();
     }
+    
+    if (_pressureEnabled) {
+        _updatePressure();
+    }
+    
+    if (_lightEnabled) {
+        _updateLightLevel();
+    }
+    
+    if (_motionEnabled) {
+        _updateMotionDetection();
+    }
+    
+    if (_batteryEnabled) {
+        _updateBatteryLevel();
+    }
+    
+    DEBUG_V("Sensors updated - T:%.1f H:%.1f P:%.1f L:%.1f M:%d B:%.1f", 
+           _currentReading.temperature, _currentReading.humidity, 
+           _currentReading.pressure, _currentReading.lightLevel,
+           _currentReading.motionDetected, _currentReading.batteryLevel);
 }
 
-// ================================
-// API HANDLERS
-// ================================
+void SensorManager::_updateTemperature() {
+    _currentReading.temperature = _generateSensorValue(_tempBase, TEMP_VARIATION, _tempTrend);
+    _currentReading.temperature += _tempOffset;
+    _currentReading.temperature = _applyNoise(_currentReading.temperature, 0.1);
+}
 
-void WebServerManager::_handleAPIScan(AsyncWebServerRequest* request) {
-    _requestCount++;
+void SensorManager::_updateHumidity() {
+    _currentReading.humidity = _generateSensorValue(_humidityBase, HUMIDITY_VARIATION, _humidityTrend);
+    _currentReading.humidity += _humidityOffset;
+    _currentReading.humidity = constrain(_currentReading.humidity, 0.0, 100.0);
+    _currentReading.humidity = _applyNoise(_currentReading.humidity, 0.5);
+}
+
+void SensorManager::_updatePressure() {
+    _currentReading.pressure = _generateSensorValue(_pressureBase, PRESSURE_VARIATION, _pressureTrend);
+    _currentReading.pressure += _pressureOffset;
+    _currentReading.pressure = _applyNoise(_currentReading.pressure, 0.5);
+}
+
+void SensorManager::_updateLightLevel() {
+    // Simulate day/night cycle
+    unsigned long timeOfDay = (millis() / 1000) % 86400; // Seconds in a day
+    float dayFactor = sin((timeOfDay * 2 * PI) / 86400) * 0.5 + 0.5;
     
-    DEBUG_D("API: WiFi scan request");
+    _lightBase = 20.0 + (dayFactor * 80.0); // 20-100% light level
+    _currentReading.lightLevel = _generateSensorValue(_lightBase, 10.0, _lightTrend);
+    _currentReading.lightLevel = constrain(_currentReading.lightLevel, 0.0, 100.0);
+    _currentReading.lightLevel = _applyNoise(_currentReading.lightLevel, 1.0);
+}
+
+void SensorManager::_updateMotionDetection() {
+    if (!_motionActive && _shouldTriggerMotion()) {
+        _motionActive = true;
+        _motionStartTime = millis();
+        _lastMotionEvent = _motionStartTime;
+        _motionEventCount++;
+        DEBUG_D("Motion detected! Event #%d", _motionEventCount);
+    }
     
-    if (!_wifiManager) {
-        _sendErrorResponse(request, "WiFi manager not available");
+    _currentReading.motionDetected = _motionActive;
+}
+
+void SensorManager::_updateBatteryLevel() {
+    _simulateBatteryDrain();
+    _currentReading.batteryLevel = _batteryLevel;
+}
+
+void SensorManager::_addToHistory(const SensorReading& reading) {
+    _history.push_back(reading);
+    
+    // Maintain history size limit
+    while (_history.size() > _maxHistorySize) {
+        _history.erase(_history.begin());
+    }
+    
+    _statsValid = false; // Invalidate statistics
+}
+
+void SensorManager::_updateStatistics() {
+    _calculateStatistics();
+}
+
+void SensorManager::_calculateStatistics() {
+    if (_history.empty()) {
+        _statsValid = false;
         return;
     }
     
-    // Start network scan
-    int networkCount = _wifiManager->scanNetworks();
+    // Initialize min/max values
+    _stats.minTemperature = _history[0].temperature;
+    _stats.maxTemperature = _history[0].temperature;
+    _stats.minHumidity = _history[0].humidity;
+    _stats.maxHumidity = _history[0].humidity;
+    _stats.minPressure = _history[0].pressure;
+    _stats.maxPressure = _history[0].pressure;
+    _stats.minLightLevel = _history[0].lightLevel;
+    _stats.maxLightLevel = _history[0].lightLevel;
     
-    if (networkCount >= 0) {
-        String networksJSON = _wifiManager->getScannedNetworksJSON();
-        _sendJSONResponse(request, networksJSON);
-    } else {
-        _sendErrorResponse(request, "Network scan failed");
-    }
-}
-
-void WebServerManager::_handleAPIConnect(AsyncWebServerRequest* request) {
-    _requestCount++;
+    // Calculate sums for averages
+    float tempSum = 0, humiditySum = 0, pressureSum = 0, lightSum = 0;
     
-    DEBUG_D("API: WiFi connect request");
-    
-    if (!_wifiManager) {
-        _sendErrorResponse(request, "WiFi manager not available");
-        return;
-    }
-    
-    // Get POST parameters
-    String ssid = "";
-    String password = "";
-    
-    if (request->hasParam("ssid", true)) {
-        ssid = request->getParam("ssid", true)->value();
-    }
-    
-    if (request->hasParam("password", true)) {
-        password = request->getParam("password", true)->value();
-    }
-    
-    if (ssid.length() == 0) {
-        _sendErrorResponse(request, "SSID is required");
-        return;
-    }
-    
-    // Attempt connection
-    bool connected = _wifiManager->connectToWiFi(ssid, password);
-    
-    if (connected) {
-        String response = "{\"success\":true,\"message\":\"Connected to " + ssid + "\"}";
-        _sendJSONResponse(request, response);
-    } else {
-        _sendErrorResponse(request, "Failed to connect to " + ssid);
-    }
-}
-
-void WebServerManager::_handleAPIStatus(AsyncWebServerRequest* request) {
-    _requestCount++;
-    
-    DEBUG_V("API: Status request");
-    
-    String statusJSON = "{\"server\":" + getServerStatus();
-    
-    if (_wifiManager) {
-        statusJSON += ",\"wifi\":" + _wifiManager->getStatusJSON();
-    }
-    
-    if (_sensorManager) {
-        statusJSON += ",\"sensors\":" + _sensorManager->getSensorDataJSON();
-    }
-    
-    statusJSON += "}";
-    
-    _sendJSONResponse(request, statusJSON);
-}
-
-void WebServerManager::_handleAPISensorData(AsyncWebServerRequest* request) {
-    _requestCount++;
-    
-    DEBUG_V("API: Sensor data request");
-    
-    if (_sensorManager) {
-        String sensorData = _sensorManager->getSensorDataJSON();
-        _sendJSONResponse(request, sensorData);
-    } else {
-        _sendErrorResponse(request, "Sensor manager not available");
-    }
-}
-
-void WebServerManager::_handleAPIDeviceStats(AsyncWebServerRequest* request) {
-    _requestCount++;
-    
-    DEBUG_V("API: Device stats request");
-    
-    if (_sensorManager) {
-        String deviceStats = _sensorManager->getDeviceStatsJSON();
-        _sendJSONResponse(request, deviceStats);
-    } else {
-        _sendErrorResponse(request, "Sensor manager not available");
-    }
-}
-
-void WebServerManager::_handleAPIDeviceName(AsyncWebServerRequest* request) {
-    _requestCount++;
-    
-    DEBUG_D("API: Device name change request");
-    
-    String newName = "";
-    
-    if (request->hasParam("name", true)) {
-        newName = request->getParam("name", true)->value();
-    }
-    
-    if (!_validateDeviceName(newName)) {
-        _sendErrorResponse(request, "Invalid device name. Must be 3-32 characters, alphanumeric with hyphens/underscores only");
-        return;
-    }
-    
-    // Call the callback to change device name
-    if (_onDeviceNameChangeCallback) {
-        _onDeviceNameChangeCallback(newName);
+    for (const auto& reading : _history) {
+        // Temperature
+        _stats.minTemperature = min(_stats.minTemperature, reading.temperature);
+        _stats.maxTemperature = max(_stats.maxTemperature, reading.temperature);
+        tempSum += reading.temperature;
         
-        String response = "{\"success\":true,\"message\":\"Device name changed to: " + newName + "\"}";
-        _sendJSONResponse(request, response);
-    } else {
-        _sendErrorResponse(request, "Device name change not supported");
-    }
-}
-
-void WebServerManager::_handleAPILEDControl(AsyncWebServerRequest* request) {
-    _requestCount++;
-    
-    DEBUG_D("API: LED control request");
-    
-    if (!request->hasParam("state", true)) {
-        _sendErrorResponse(request, "LED state parameter required");
-        return;
-    }
-    
-    String stateParam = request->getParam("state", true)->value();
-    bool ledState = (stateParam == "true" || stateParam == "1" || stateParam == "on");
-    
-    if (_onLEDControlCallback) {
-        _onLEDControlCallback(ledState);
+        // Humidity
+        _stats.minHumidity = min(_stats.minHumidity, reading.humidity);
+        _stats.maxHumidity = max(_stats.maxHumidity, reading.humidity);
+        humiditySum += reading.humidity;
         
-        String response = "{\"success\":true,\"message\":\"LED turned " + String(ledState ? "on" : "off") + "\"}";
-        _sendJSONResponse(request, response);
-    } else {
-        _sendErrorResponse(request, "LED control not supported");
-    }
-}
-
-void WebServerManager::_handleAPIFactoryReset(AsyncWebServerRequest* request) {
-    _requestCount++;
-    
-    DEBUG_I("API: Factory reset request");
-    
-    String response = "{\"success\":true,\"message\":\"Factory reset initiated. Device will restart in 3 seconds.\"}";
-    _sendJSONResponse(request, response);
-    
-    // Delay and then call factory reset
-    if (_onFactoryResetCallback) {
-        // Use a timer to delay the reset so the response can be sent
-        static AsyncDelay resetDelay;
-        resetDelay.start(3000, AsyncDelay::MILLIS);
+        // Pressure
+        _stats.minPressure = min(_stats.minPressure, reading.pressure);
+        _stats.maxPressure = max(_stats.maxPressure, reading.pressure);
+        pressureSum += reading.pressure;
         
-        // This is a simplified approach - in a real implementation you'd use a proper timer
-        delay(3000);
-        _onFactoryResetCallback();
-    }
-}
-
-void WebServerManager::_handleAPIRestart(AsyncWebServerRequest* request) {
-    _requestCount++;
-    
-    DEBUG_I("API: Restart request");
-    
-    String response = "{\"success\":true,\"message\":\"Device restart initiated. Device will restart in 3 seconds.\"}";
-    _sendJSONResponse(request, response);
-    
-    // Delay and then restart
-    if (_onRestartCallback) {
-        delay(3000);
-        _onRestartCallback();
-    }
-}
-
-// ================================
-// WEBSOCKET HANDLERS
-// ================================
-
-void WebServerManager::_onWebSocketEvent(AsyncWebSocket* server, AsyncWebSocketClient* client, 
-                                        AwsEventType type, void* arg, uint8_t* data, size_t len) {
-    switch (type) {
-        case WS_EVT_CONNECT:
-            DEBUG_I("WebSocket client connected: %u from %s", client->id(), client->remoteIP().toString().c_str());
-            
-            // Send initial data to new client
-            if (_sensorManager) {
-                client->text(_sensorManager->getSensorDataJSON());
-            }
-            break;
-            
-        case WS_EVT_DISCONNECT:
-            DEBUG_I("WebSocket client disconnected: %u", client->id());
-            break;
-            
-        case WS_EVT_DATA: {
-            AwsFrameInfo* info = (AwsFrameInfo*)arg;
-            if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-                String message = "";
-                for (size_t i = 0; i < len; i++) {
-                    message += (char)data[i];
-                }
-                _handleWebSocketMessage(client, message);
-            }
-            break;
-        }
-        
-        case WS_EVT_PONG:
-        case WS_EVT_ERROR:
-            break;
-    }
-}
-
-void WebServerManager::_handleWebSocketMessage(AsyncWebSocketClient* client, const String& message) {
-    DEBUG_D("WebSocket message from client %u: %s", client->id(), message.c_str());
-    
-    // Parse JSON message
-    DynamicJsonDocument doc(512);
-    DeserializationError error = deserializeJson(doc, message);
-    
-    if (error) {
-        DEBUG_W("Failed to parse WebSocket JSON message");
-        return;
+        // Light
+        _stats.minLightLevel = min(_stats.minLightLevel, reading.lightLevel);
+        _stats.maxLightLevel = max(_stats.maxLightLevel, reading.lightLevel);
+        lightSum += reading.lightLevel;
     }
     
-    String command = doc["command"] | "";
+    // Calculate averages
+    int count = _history.size();
+    _stats.avgTemperature = tempSum / count;
+    _stats.avgHumidity = humiditySum / count;
+    _stats.avgPressure = pressureSum / count;
+    _stats.avgLightLevel = lightSum / count;
     
-    if (command == "get_sensor_data") {
-        if (_sensorManager) {
-            client->text(_sensorManager->getSensorDataJSON());
-        }
-    } else if (command == "get_device_stats") {
-        if (_sensorManager) {
-            client->text(_sensorManager->getDeviceStatsJSON());
-        }
-    } else if (command == "led_control") {
-        bool state = doc["state"] | false;
-        if (_onLEDControlCallback) {
-            _onLEDControlCallback(state);
-        }
-    } else {
-        DEBUG_W("Unknown WebSocket command: %s", command.c_str());
-    }
-}
-
-// ================================
-// UTILITY METHODS
-// ================================
-
-void WebServerManager::_sendJSONResponse(AsyncWebServerRequest* request, const String& json, int code) {
-    AsyncWebServerResponse* response = request->beginResponse(code, "application/json", json);
-    _addCORSHeaders(response);
-    request->send(response);
-}
-
-void WebServerManager::_sendErrorResponse(AsyncWebServerRequest* request, const String& error, int code) {
-    _errorCount++;
+    // Motion statistics
+    _stats.motionEvents = _motionEventCount;
+    _stats.lastMotionTime = _lastMotionEvent;
     
-    String json = "{\"success\":false,\"error\":\"" + error + "\"}";
-    _sendJSONResponse(request, json, code);
-}
-
-bool WebServerManager::_validateDeviceName(const String& name) {
-    if (name.length() < DEVICE_NAME_MIN_LENGTH || name.length() > DEVICE_NAME_MAX_LENGTH) {
-        return false;
-    }
-    
-    // Check for allowed characters
-    for (int i = 0; i < name.length(); i++) {
-        char c = name.charAt(i);
-        if (!isAlphaNumeric(c) && c != '-' && c != '_' && c != ' ') {
-            return false;
-        }
-    }
-    
-    return true;
-}
-
-void WebServerManager::_addCORSHeaders(AsyncWebServerResponse* response) {
-    response->addHeader("Access-Control-Allow-Origin", "*");
-    response->addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    response->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-}
-
-String WebServerManager::getServerStatus() {
-    String json = "{";
-    json += "\"running\":" + String(_isRunning ? "true" : "false") + ",";
-    json += "\"uptime\":" + String(_isRunning ? (millis() - _startTime) : 0) + ",";
-    json += "\"requests\":" + String(_requestCount) + ",";
-    json += "\"errors\":" + String(_errorCount) + ",";
-    json += "\"websocket_clients\":" + String(getWebSocketClientCount()) + ",";
-    json += "\"free_heap\":" + String(ESP.getFreeHeap());
-    json += "}";
-    
-    return json;
-}
-
-// ================================
-// STATIC CALLBACK WRAPPERS
-// ================================
-
-void WebServerManager::_staticWebSocketEvent(AsyncWebSocket* server, AsyncWebSocketClient* client, 
-                                           AwsEventType type, void* arg, uint8_t* data, size_t len) {
-    if (_instance) {
-        _instance->_onWebSocketEvent(server, client, type, arg, data, len);
-    }
-}
-
+    // Battery health (simplified calculation)
+    _stats.batteryHealth = max(50.0,
